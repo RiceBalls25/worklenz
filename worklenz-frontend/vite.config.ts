@@ -11,8 +11,7 @@ export default defineConfig(({ command, mode }) => {
 
   const env = loadEnv(mode, process.cwd(), '');
   const hasSentryToken = Boolean(env.VITE_SENTRY_AUTH_TOKEN);
-  const shouldGenerateSourcemap =
-    hasSentryToken || env.VITE_GENERATE_SOURCEMAP === 'true';
+  const shouldGenerateSourcemap = hasSentryToken || env.VITE_GENERATE_SOURCEMAP === 'true';
 
   return {
     // **Esbuild optimization: fast multi-threaded JS transform and debug stripping**
@@ -148,7 +147,17 @@ export default defineConfig(({ command, mode }) => {
       // **Proxy API requests to backend server**
       proxy: {
         '/api': {
-          target: process.env.VITE_API_URL || 'http://localhost:3000',
+          target: 'http://localhost:3000',
+          changeOrigin: true,
+          secure: false,
+        },
+        '/secure': {
+          target: 'http://localhost:3000',
+          changeOrigin: true,
+          secure: false,
+        },
+        '/csrf-token': {
+          target: 'http://localhost:3000',
           changeOrigin: true,
           secure: false,
         },
@@ -223,10 +232,7 @@ export default defineConfig(({ command, mode }) => {
       rollupOptions: {
         // Suppress noisy third-party warnings (gantt-task-react misplaced PURE annotations)
         onwarn(warning, warn) {
-          if (
-            warning.code === 'INVALID_ANNOTATION' &&
-            warning.id?.includes('gantt-task-react')
-          ) {
+          if (warning.code === 'INVALID_ANNOTATION' && warning.id?.includes('gantt-task-react')) {
             return;
           }
           warn(warning);

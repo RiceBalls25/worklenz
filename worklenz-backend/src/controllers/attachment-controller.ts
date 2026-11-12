@@ -72,8 +72,8 @@ export default class AttachmentController extends WorklenzControllerBase {
     const { file, file_name, task_id, project_id, size, type } = req.body;
 
     const q = `
-      INSERT INTO task_attachments (name, task_id, team_id, project_id, uploaded_by, size, type)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      INSERT INTO task_attachments (name, task_id, team_id, project_id, uploaded_by, size, type, upload_confirmed_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
       RETURNING id, name, size, type, created_at, CONCAT($8::TEXT, '/', team_id, '/', project_id, '/', id, '.', type) AS url;
     `;
 
@@ -98,6 +98,12 @@ export default class AttachmentController extends WorklenzControllerBase {
       return res
         .status(200)
         .send(new ServerResponse(false, null, "Attachment upload failed"));
+
+    // The legacy Base64 upload path must also publish only after storage succeeds.
+    await db.query(
+      "UPDATE task_attachments SET upload_confirmed_at = NOW() WHERE id = $1",
+      [data.id],
+    );
 
     // Bump task updated_at so "Updated X ago" reflects the new attachment
     await db.query(`UPDATE tasks SET updated_at = NOW() WHERE id = $1;`, [
@@ -255,10 +261,10 @@ export default class AttachmentController extends WorklenzControllerBase {
         );
     }
 
-    // --- Insert a pending record ---
+    // Pending until the browser PUT completes and /confirm verifies the object.
     await db.query(
-      `INSERT INTO task_attachments (id, name, size, type, task_id, project_id, team_id, uploaded_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8);`,
+      `INSERT INTO task_attachments (id, name, size, type, task_id, project_id, team_id, uploaded_by, upload_confirmed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL);`,
       [
         fileId,
         cleanFileName,
@@ -331,6 +337,11 @@ export default class AttachmentController extends WorklenzControllerBase {
     }
 
     const attachment = attachmentResult.rows[0];
+    if (attachment.task_id !== task_id) {
+      return res.status(403).send(
+        new ServerResponse(false, null, "Attachment does not belong to this task"),
+      );
+    }
 
     // Verify the object actually exists in storage and read its real size —
     // the size on the attachment record at this point is still the
@@ -346,17 +357,15 @@ export default class AttachmentController extends WorklenzControllerBase {
     const actualSize = await getObjectSize(storageKey);
 
     if (actualSize === null) {
-      // Clean up the pending record if file doesn't exist in storage
-      await db.query("DELETE FROM task_attachments WHERE id = $1", [file_id]);
-      return res
-        .status(400)
-        .send(
-          new ServerResponse(
-            false,
-            null,
-            "Upload verification failed. File not found in storage.",
-          ),
-        );
+      // A missing object or an uncertain storage result must not be treated as
+      // a successful upload. Keep the record pending so confirmation can retry.
+      return res.status(409).send(
+        new ServerResponse(
+          false,
+          null,
+          "Upload not verified. Check storage and retry confirmation.",
+        ),
+      );
     }
 
     if (actualSize > MAX_PRESIGN_FILE_SIZE_BYTES) {
@@ -375,11 +384,14 @@ export default class AttachmentController extends WorklenzControllerBase {
         );
     }
 
-    // Persist the real, storage-verified size rather than the client-declared one.
-    await db.query("UPDATE task_attachments SET size = $1 WHERE id = $2", [
-      actualSize,
-      file_id,
-    ]);
+    // Publish only after storage HEAD verification. Repeated confirms are safe.
+    await db.query(
+      "UPDATE task_attachments SET size = $1, upload_confirmed_at = COALESCE(upload_confirmed_at, NOW()) WHERE id = $2",
+      [
+        actualSize,
+        file_id,
+      ],
+    );
 
     // Bump task updated_at
     await db.query(`UPDATE tasks SET updated_at = NOW() WHERE id = $1;`, [
@@ -504,7 +516,7 @@ export default class AttachmentController extends WorklenzControllerBase {
              type,
              created_at
       FROM task_attachments
-      WHERE task_id = $1;
+      WHERE task_id = $1 AND upload_confirmed_at IS NOT NULL;
     `;
     const result = await db.query(q, [
       req.params.id,
@@ -540,11 +552,13 @@ export default class AttachmentController extends WorklenzControllerBase {
                                   FROM task_attachments
                                           LEFT JOIN tasks t ON task_attachments.task_id = t.id
                                   WHERE task_attachments.project_id = $1
+                                    AND task_attachments.upload_confirmed_at IS NOT NULL
                                   ORDER BY created_at DESC
                           LIMIT $3 OFFSET $4)t) AS data
                     FROM task_attachments
                             LEFT JOIN tasks t ON task_attachments.task_id = t.id
-                    WHERE task_attachments.project_id = $1) rec;
+                    WHERE task_attachments.project_id = $1
+                      AND task_attachments.upload_confirmed_at IS NOT NULL) rec;
     `;
     const result = await db.query(q, [
       req.params.id,
@@ -603,7 +617,7 @@ export default class AttachmentController extends WorklenzControllerBase {
   ): Promise<IWorkLenzResponse> {
     const q = `SELECT team_id, project_id, id, type
                FROM task_attachments
-               WHERE id = $1;`;
+               WHERE id = $1 AND upload_confirmed_at IS NOT NULL;`;
     const result = await db.query(q, [req.query.id]);
     const [data] = result.rows;
 

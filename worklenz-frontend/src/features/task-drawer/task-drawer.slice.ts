@@ -58,6 +58,7 @@ const normalizeAssigneeNames = (
 };
 
 export type TaskDrawerTabKey = 'info' | 'timeLog' | 'activityLog';
+export type TaskDrawerMode = 'create' | 'edit';
 
 interface ITaskDrawerState {
   selectedTaskId: string | null;
@@ -72,6 +73,7 @@ interface ITaskDrawerState {
   targetCommentId: string | null;
   /** When set, TaskDrawer opens on this tab then clears the value. */
   targetDrawerTab: TaskDrawerTabKey | null;
+  drawerMode: TaskDrawerMode;
   /** Id of the most recent task deleted from the drawer, for views that keep local task state. */
   lastDeletedTaskId: string | null;
   timeLogEditing: {
@@ -79,7 +81,6 @@ interface ITaskDrawerState {
     logBeingEdited: ITaskLogViewModel | null;
   };
   navigationContext: {
-
     taskIds: string[];
     currentIndex: number;
     sourceView: 'task-list' | 'kanban' | 'board' | 'home' | 'gantt' | 'workload';
@@ -97,9 +98,9 @@ const initialState: ITaskDrawerState = {
   taskAccessFrom: null,
   targetCommentId: null,
   targetDrawerTab: null,
+  drawerMode: 'edit',
   lastDeletedTaskId: null,
   timeLogEditing: {
-
     isEditing: false,
     logBeingEdited: null,
   },
@@ -109,8 +110,11 @@ const initialState: ITaskDrawerState = {
 export const TASK_ASSIGNEE_RESTRICTED_CODE = 'TASK_ASSIGNEE_RESTRICTED';
 
 const isTaskAssigneeRestrictedError = (error: unknown): boolean => {
-  const response = (error as { response?: { status?: number; data?: { body?: { code?: string }; message?: string } } })
-    ?.response;
+  const response = (
+    error as {
+      response?: { status?: number; data?: { body?: { code?: string }; message?: string } };
+    }
+  )?.response;
   if (response?.status !== 403) return false;
   // Only the coded TVR-11 response — the same message text is also used for
   // team-mismatch 403s, which must not show the "assigned to you only" UI.
@@ -195,7 +199,29 @@ const taskDrawerSlice = createSlice({
   name: 'taskDrawer',
   initialState,
   reducers: {
+    openCreateTaskDrawer: state => {
+      state.drawerMode = 'create';
+
+      // 创建前不存在真实任务 ID
+      state.selectedTaskId = null;
+      state.taskFormViewModel = null;
+
+      // 清理上一条任务的相关状态
+      state.subscribers = [];
+      state.navigationContext = null;
+      state.loadingTask = false;
+      state.timeLogEditing = resetTimeLogEditing;
+      state.taskAccessDenied = false;
+      state.taskAccessFrom = null;
+      state.targetCommentId = null;
+      state.targetDrawerTab = null;
+
+      state.showTaskDrawer = true;
+    },
     setSelectedTaskId: (state, action) => {
+      if (action.payload) {
+        state.drawerMode = 'edit';
+      }
       state.selectedTaskId = action.payload;
       state.timeLogEditing = resetTimeLogEditing; // ← reset when switching tasks
       state.taskAccessDenied = false;
@@ -203,16 +229,17 @@ const taskDrawerSlice = createSlice({
       state.taskAccessFrom = null;
 
       if (action.payload) {
-        state.taskFormViewModel = state.taskFormViewModel?.task?.id === action.payload
-          ? state.taskFormViewModel
-          : {
-              task: {
-                id: action.payload,
-                assignees: [],
-                names: [],
-                assignee_names: [],
-              } as any,
-            };
+        state.taskFormViewModel =
+          state.taskFormViewModel?.task?.id === action.payload
+            ? state.taskFormViewModel
+            : {
+                task: {
+                  id: action.payload,
+                  assignees: [],
+                  names: [],
+                  assignee_names: [],
+                } as any,
+              };
       }
     },
     setShowTaskDrawer: (state, action) => {
@@ -234,10 +261,7 @@ const taskDrawerSlice = createSlice({
     setTargetDrawerTab: (state, action: PayloadAction<TaskDrawerTabKey | null>) => {
       state.targetDrawerTab = action.payload;
     },
-    setTaskAccessFrom: (
-      state,
-      action: PayloadAction<'notification' | 'mention' | null>
-    ) => {
+    setTaskAccessFrom: (state, action: PayloadAction<'notification' | 'mention' | null>) => {
       state.taskAccessFrom = action.payload;
     },
     clearTaskAccessDenied: state => {
@@ -251,9 +275,12 @@ const taskDrawerSlice = createSlice({
       if (!action.payload) return;
       const { status_id, color_code, id: taskId, color_code_dark } = action.payload;
       if (state.taskFormViewModel?.task && state.taskFormViewModel.task.id === taskId) {
-        state.taskFormViewModel.task.status_id = status_id ?? state.taskFormViewModel.task.status_id;
-        state.taskFormViewModel.task.status_color = color_code ?? state.taskFormViewModel.task.status_color;
-        state.taskFormViewModel.task.status_color_dark = color_code_dark ?? state.taskFormViewModel.task.status_color_dark;
+        state.taskFormViewModel.task.status_id =
+          status_id ?? state.taskFormViewModel.task.status_id;
+        state.taskFormViewModel.task.status_color =
+          color_code ?? state.taskFormViewModel.task.status_color;
+        state.taskFormViewModel.task.status_color_dark =
+          color_code_dark ?? state.taskFormViewModel.task.status_color_dark;
       }
     },
     setStartDate: (state, action: PayloadAction<IProjectTask>) => {
@@ -279,7 +306,12 @@ const taskDrawerSlice = createSlice({
     },
     setTaskAssignee: (state, action: PayloadAction<IProjectTask>) => {
       if (!action.payload) return;
-      const { assignees, id: taskId, names, assignee_names } = action.payload as IProjectTask & {
+      const {
+        assignees,
+        id: taskId,
+        names,
+        assignee_names,
+      } = action.payload as IProjectTask & {
         assignee_names?: InlineMember[];
       };
       if (state.taskFormViewModel?.task && state.taskFormViewModel.task.id === taskId) {
@@ -511,7 +543,8 @@ const taskDrawerSlice = createSlice({
         const existingTask = state.taskFormViewModel?.task;
         const existingDueTime = existingTask?.due_time;
         const existingAssignees = existingTask?.assignees;
-        const existingNames = existingTask?.assignee_names || (existingTask?.names as unknown as InlineMember[]);
+        const existingNames =
+          existingTask?.assignee_names || (existingTask?.names as unknown as InlineMember[]);
 
         state.taskFormViewModel = action.payload;
 
@@ -520,32 +553,26 @@ const taskDrawerSlice = createSlice({
           state.taskFormViewModel?.task &&
           state.taskFormViewModel.task.id === existingTask.id
         ) {
-          if (
-            existingDueTime &&
-            !state.taskFormViewModel.task.due_time
-          ) {
+          if (existingDueTime && !state.taskFormViewModel.task.due_time) {
             state.taskFormViewModel.task.due_time = existingDueTime;
           }
 
-          if (
-            !state.taskFormViewModel.task?.assignees?.length &&
-            existingAssignees?.length
-          ) {
+          if (!state.taskFormViewModel.task?.assignees?.length && existingAssignees?.length) {
             state.taskFormViewModel.task.assignees = existingAssignees;
           }
 
-          if (
-            !state.taskFormViewModel.task?.assignee_names?.length &&
-            existingNames?.length
-          ) {
-            state.taskFormViewModel.task.assignee_names = normalizeAssigneeNames(undefined, existingNames);
+          if (!state.taskFormViewModel.task?.assignee_names?.length && existingNames?.length) {
+            state.taskFormViewModel.task.assignee_names = normalizeAssigneeNames(
+              undefined,
+              existingNames
+            );
           }
 
-          if (
-            !state.taskFormViewModel.task?.names?.length &&
-            existingNames?.length
-          ) {
-            (state.taskFormViewModel.task as any).names = normalizeAssigneeNames(undefined, existingNames);
+          if (!state.taskFormViewModel.task?.names?.length && existingNames?.length) {
+            (state.taskFormViewModel.task as any).names = normalizeAssigneeNames(
+              undefined,
+              existingNames
+            );
           }
         }
       }),
@@ -558,10 +585,7 @@ const taskDrawerSlice = createSlice({
 
         state.loadingTask = false;
         const payload = action.payload as { code?: string } | string | undefined;
-        if (
-          typeof payload === 'object' &&
-          payload?.code === TASK_ASSIGNEE_RESTRICTED_CODE
-        ) {
+        if (typeof payload === 'object' && payload?.code === TASK_ASSIGNEE_RESTRICTED_CODE) {
           state.taskAccessDenied = true;
           state.taskFormViewModel = null;
         }
@@ -605,5 +629,6 @@ export const {
   syncNavigationIndex,
   setTaskDrawerStatuses,
   resetTaskDrawer,
+  openCreateTaskDrawer,
 } = taskDrawerSlice.actions;
 export default taskDrawerSlice.reducer;

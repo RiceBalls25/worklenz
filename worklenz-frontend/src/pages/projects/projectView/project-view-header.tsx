@@ -22,7 +22,6 @@ import { useNavigate } from 'react-router-dom';
 import { useState, useCallback, useMemo, memo, useRef, useEffect } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 
-
 import { colors } from '@/styles/colors';
 import { getContrastColor } from '@/utils/colorUtils';
 import { decodeHtmlEntities } from '@/utils/html-entities';
@@ -48,11 +47,18 @@ import {
 } from '@features/tasks/tasks.slice';
 import ProjectStatusIcon from '@/components/common/project-status-icon/project-status-icon';
 import { formatDate } from '@/utils/timeUtils';
-import { toggleSaveAsTemplateDrawer, openSaveAsTemplateDrawer } from '@/features/projects/projectsSlice';
+import {
+  toggleSaveAsTemplateDrawer,
+  openSaveAsTemplateDrawer,
+} from '@/features/projects/projectsSlice';
 import SaveProjectAsTemplate from '@/components/save-project-as-template/save-project-as-template';
-import { fetchProjectData, setProjectId, setProjectData } from '@/features/project/project-drawer.slice';
+import {
+  fetchProjectData,
+  setProjectId,
+  setProjectData,
+} from '@/features/project/project-drawer.slice';
 import { openProjectSettingsModal } from '@/features/project/project-settings-modal.slice';
-import { setSelectedTaskId, setShowTaskDrawer } from '@/features/task-drawer/task-drawer.slice';
+import { openCreateTaskDrawer } from '@/features/task-drawer/task-drawer.slice';
 import { ITaskCreateRequest } from '@/types/tasks/task-create-request.types';
 import { DEFAULT_TASK_NAME, UNMAPPED } from '@/shared/constants';
 import { IProjectTask } from '@/types/project/projectTasksViewModel.types';
@@ -237,49 +243,64 @@ const ProjectViewHeader = memo(() => {
     }
   }, [dispatch, selectedProject]);
 
+  // const handleCreateTask = useCallback(() => {
+  //   if (isSoftwareProject) {
+  //     dispatch(openCreateIssueModal());
+  //     return;
+  //   }
+  //   if (!selectedProject?.id || !currentSession?.id || !socket) return;
+
+  //   try {
+  //     setCreatingTask(true);
+
+  //     const body: Partial<ITaskCreateRequest> = {
+  //       name: t('defaultTaskName', { defaultValue: 'Untitled Task' }),
+  //       project_id: selectedProject.id,
+  //       reporter_id: currentSession.id,
+  //       team_id: currentSession.team_id,
+  //     };
+
+  //     const handleTaskCreated = (task: IProjectTask) => {
+  //       if (task.id) {
+  //         dispatch(setSelectedTaskId(task.id));
+  //         dispatch(setShowTaskDrawer(true));
+
+  //         const groupId = groupBy === IGroupBy.PHASE ? UNMAPPED : getGroupIdByGroupedColumn(task);
+  //         if (groupId) {
+  //           if (tab === 'board') {
+  //             dispatch(addTaskCardToTheTop({ sectionId: groupId, task }));
+  //           } else {
+  //             dispatch(addTask({ task, groupId }));
+  //           }
+  //           socket.emit(SocketEvents.GET_TASK_PROGRESS.toString(), task.id);
+  //         }
+  //       }
+  //       setCreatingTask(false);
+  //     };
+
+  //     socket.once(SocketEvents.QUICK_TASK.toString(), handleTaskCreated);
+  //     socket.emit(SocketEvents.QUICK_TASK.toString(), JSON.stringify(body));
+  //   } catch (error) {
+  //     logger.error('Error creating task', error);
+  //     setCreatingTask(false);
+  //   }
+  // }, [isSoftwareProject, selectedProject?.id, currentSession, socket, dispatch, groupBy, tab, t]);
+
   const handleCreateTask = useCallback(() => {
+    // 保留软件项目原有的 Issue 创建入口
     if (isSoftwareProject) {
       dispatch(openCreateIssueModal());
       return;
     }
-    if (!selectedProject?.id || !currentSession?.id || !socket) return;
 
-    try {
-      setCreatingTask(true);
-
-      const body: Partial<ITaskCreateRequest> = {
-        name: t('defaultTaskName', { defaultValue: 'Untitled Task' }),
-        project_id: selectedProject.id,
-        reporter_id: currentSession.id,
-        team_id: currentSession.team_id,
-      };
-
-      const handleTaskCreated = (task: IProjectTask) => {
-        if (task.id) {
-          dispatch(setSelectedTaskId(task.id));
-          dispatch(setShowTaskDrawer(true));
-
-          const groupId = groupBy === IGroupBy.PHASE ? UNMAPPED : getGroupIdByGroupedColumn(task);
-          if (groupId) {
-            if (tab === 'board') {
-              dispatch(addTaskCardToTheTop({ sectionId: groupId, task }));
-            } else {
-              dispatch(addTask({ task, groupId }));
-            }
-            socket.emit(SocketEvents.GET_TASK_PROGRESS.toString(), task.id);
-          }
-        }
-        setCreatingTask(false);
-      };
-
-      socket.once(SocketEvents.QUICK_TASK.toString(), handleTaskCreated);
-      socket.emit(SocketEvents.QUICK_TASK.toString(), JSON.stringify(body));
-    } catch (error) {
-      logger.error('Error creating task', error);
-      setCreatingTask(false);
+    // 保留项目、用户和创建权限检查
+    if (!selectedProject?.id || !currentSession?.id || !canCreateTask) {
+      return;
     }
-  }, [isSoftwareProject, selectedProject?.id, currentSession, socket, dispatch, groupBy, tab, t]);
 
+    // 仅打开原有 TaskDrawer，不发送 QUICK_TASK
+    dispatch(openCreateTaskDrawer());
+  }, [isSoftwareProject, selectedProject?.id, currentSession?.id, canCreateTask, dispatch]);
   const handleImportTaskTemplate = useCallback(() => {
     if (isFreeUser(currentSession)) {
       dispatch(toggleUpgradeModal());
@@ -319,10 +340,7 @@ const ProjectViewHeader = memo(() => {
             break;
           }
           default:
-            await Promise.all([
-              projectPromise,
-              new Promise(resolve => setTimeout(resolve, 1000)),
-            ]);
+            await Promise.all([projectPromise, new Promise(resolve => setTimeout(resolve, 1000))]);
             dispatch(setRefreshTimestamp());
             break;
         }
@@ -427,7 +445,9 @@ const ProjectViewHeader = memo(() => {
               margin: 0,
             }}
           >
-            <span style={{ fontSize: 12, color: textColor }}>{decodeHtmlEntities(selectedProject.category_name)}</span>
+            <span style={{ fontSize: 12, color: textColor }}>
+              {decodeHtmlEntities(selectedProject.category_name)}
+            </span>
           </Tag>
         </Tooltip>
       );
@@ -580,7 +600,9 @@ const ProjectViewHeader = memo(() => {
         key="settings"
         title={
           isGuest
-            ? t('settingsDisabledForGuest', { defaultValue: 'Project settings are not accessible for guest users' })
+            ? t('settingsDisabledForGuest', {
+                defaultValue: 'Project settings are not accessible for guest users',
+              })
             : t('settingsTooltip', { defaultValue: 'Open project settings' })
         }
       >
@@ -651,10 +673,7 @@ const ProjectViewHeader = memo(() => {
 
     if (isOwnerOrAdmin) {
       actions.push(
-        <Tooltip
-          key="create-task-tooltip"
-          title={createTaskTooltip}
-        >
+        <Tooltip key="create-task-tooltip" title={createTaskTooltip}>
           <Dropdown.Button
             key="create-task-dropdown"
             className={styles.createTaskButton}
@@ -671,10 +690,7 @@ const ProjectViewHeader = memo(() => {
       );
     } else if (canCreateTask && !isGuest) {
       actions.push(
-        <Tooltip
-          key="create-task-tooltip"
-          title={createTaskTooltip}
-        >
+        <Tooltip key="create-task-tooltip" title={createTaskTooltip}>
           <Button
             key="create-task"
             className={styles.createTaskButton}
@@ -736,7 +752,11 @@ const ProjectViewHeader = memo(() => {
             onClick={handleNavigateToProjects}
           />
         </Tooltip>
-        <Typography.Title level={4} className={styles.projectTitle} style={{ marginBlockEnd: 0, marginInlineStart: 8 }}>
+        <Typography.Title
+          level={4}
+          className={styles.projectTitle}
+          style={{ marginBlockEnd: 0, marginInlineStart: 8 }}
+        >
           {decodeHtmlEntities(selectedProject?.name)}
         </Typography.Title>
         <div className={styles.projectAttributes}>{projectAttributes}</div>
@@ -785,22 +805,26 @@ const ProjectViewHeader = memo(() => {
         'project-settings-modal'
       )}
       {createPortal(<ImportTaskTemplate />, document.body, 'import-task-template')}
-      {createPortal(<ImportSourceModal
-        open={isCsvImportOpen}
-        onClose={() => setIsCsvImportOpen(false)}
-        source={CSV_IMPORT_SOURCE}
-        createTargetProject={async () => {
-          if (!selectedProject?.id) {
-            throw new Error('No project selected');
-          }
-          return selectedProject.id;
-        }}
-        initialProjectName={selectedProject?.name || ''}
-        hideProjectSetup
-        onImportStarted={(projectId) => {
-          waitForImportAndRefresh(projectId);
-        }}
-      />, document.body, 'import-source-modal')}
+      {createPortal(
+        <ImportSourceModal
+          open={isCsvImportOpen}
+          onClose={() => setIsCsvImportOpen(false)}
+          source={CSV_IMPORT_SOURCE}
+          createTargetProject={async () => {
+            if (!selectedProject?.id) {
+              throw new Error('No project selected');
+            }
+            return selectedProject.id;
+          }}
+          initialProjectName={selectedProject?.name || ''}
+          hideProjectSetup
+          onImportStarted={projectId => {
+            waitForImportAndRefresh(projectId);
+          }}
+        />,
+        document.body,
+        'import-source-modal'
+      )}
       {createPortal(<SaveProjectAsTemplate />, document.body, 'save-project-as-template')}
     </>
   );

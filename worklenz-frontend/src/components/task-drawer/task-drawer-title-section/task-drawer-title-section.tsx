@@ -18,21 +18,34 @@ type Props = {
   inputRef: React.RefObject<InputRef | null>;
   t: TFunction;
   canCreateTask?: boolean;
+
+  // 创建模式下，由父级提供未提交的标题
+  createName?: string;
+  onCreateNameChange?: (name: string) => void;
+  createDisabled?: boolean;
 };
 
-const TaskDrawerTitleSection = ({ inputRef, t, canCreateTask = true }: Props) => {
+const TaskDrawerTitleSection = ({
+  inputRef,
+  t,
+  canCreateTask = true,
+  createName,
+  onCreateNameChange,
+  createDisabled = false,
+}: Props) => {
   const dispatch = useAppDispatch();
   const { socket, connected } = useSocket();
   const [isEditing, setIsEditing] = useState(false);
 
-  const { taskFormViewModel, selectedTaskId, loadingTask } = useAppSelector(
+  const { taskFormViewModel, selectedTaskId, loadingTask, drawerMode } = useAppSelector(
     state => state.taskDrawerReducer
   );
+  const isCreateMode = drawerMode === 'create';
   const projectName = useAppSelector(state => state.projectReducer.project?.name ?? null);
   const isSoftwareProject = useAppSelector(state =>
     isSoftwareProjectType(state.projectReducer.project?.project_type)
   );
-  const taskManagementEntity = useAppSelector(state => 
+  const taskManagementEntity = useAppSelector(state =>
     selectedTaskId ? state.taskManagement.entities[selectedTaskId] : null
   );
 
@@ -47,18 +60,57 @@ const TaskDrawerTitleSection = ({ inputRef, t, canCreateTask = true }: Props) =>
   const originalNameRef = React.useRef<string>(decodedTaskName);
 
   useEffect(() => {
-    if (!isEditing) {
+    if (isEditing) return;
+
+    if (isCreateMode) {
+      if (createName !== undefined) {
+        setTaskName(createName);
+      }
+    } else {
       setTaskName(decodedTaskName);
     }
-  }, [decodedTaskName, isEditing]);
+  }, [isCreateMode, createName, decodedTaskName, isEditing]);
 
+  // const onTaskNameChange = (e: ChangeEvent<HTMLInputElement>) => {
+  //   const newName = e.currentTarget.value;
+  //   setTaskName(newName);
+  //   // Update Redux slices optimistically so the task list row and drawer stay in sync
+  //   if (selectedTaskId) {
+  //     dispatch(updateSelectedTaskName({ id: selectedTaskId, name: newName }));
+  //     const currentTask = store.getState().taskManagement.entities[selectedTaskId];
+  //     if (currentTask) {
+  //       dispatch(
+  //         updateTask({
+  //           ...currentTask,
+  //           title: newName,
+  //           updatedAt: new Date().toISOString(),
+  //           updated_at: new Date().toISOString(),
+  //         } as Task)
+  //       );
+  //     }
+  //   }
+  // };
   const onTaskNameChange = (e: ChangeEvent<HTMLInputElement>) => {
     const newName = e.currentTarget.value;
     setTaskName(newName);
-    // Update Redux slices optimistically so the task list row and drawer stay in sync
+
+    // create：只修改前端待提交表单
+    if (isCreateMode) {
+      onCreateNameChange?.(newName);
+      return;
+    }
+
+    // edit：保留原有 Redux 乐观更新
     if (selectedTaskId) {
-      dispatch(updateSelectedTaskName({ id: selectedTaskId, name: newName }));
+      dispatch(
+        updateSelectedTaskName({
+          id: selectedTaskId,
+          name: newName,
+        })
+      );
+
       const currentTask = store.getState().taskManagement.entities[selectedTaskId];
+
       if (currentTask) {
         dispatch(
           updateTask({
@@ -71,15 +123,15 @@ const TaskDrawerTitleSection = ({ inputRef, t, canCreateTask = true }: Props) =>
       }
     }
   };
-
   const handleStartEditing = () => {
     if (!canCreateTask) return;
     // Capture the name before the user starts typing so blur can detect a real change
-    originalNameRef.current = decodedTaskName || taskName;
+    originalNameRef.current = isCreateMode ? (createName ?? taskName) : decodedTaskName || taskName;
     setIsEditing(true);
   };
 
   const emitNameChange = (name: string) => {
+    if (isCreateMode) return;
     if (!selectedTaskId || !connected || !name.trim()) return;
     // Only emit if the name actually changed from what it was before editing started
     if (name.trim() === originalNameRef.current.trim()) return;
@@ -99,6 +151,10 @@ const TaskDrawerTitleSection = ({ inputRef, t, canCreateTask = true }: Props) =>
   };
 
   const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (isCreateMode && e.key === 'Escape') {
+      inputRef.current?.blur();
+      return;
+    }
     if (e.key === 'Enter') {
       e.preventDefault();
       setIsEditing(false);
@@ -125,7 +181,7 @@ const TaskDrawerTitleSection = ({ inputRef, t, canCreateTask = true }: Props) =>
   };
 
   // Show loading skeleton only if we're loading AND we don't have any task name (from drawer or entities)
-  const isLoadingTaskName = loadingTask && !drawerTaskName && !entityTaskName;
+  const isLoadingTaskName = !isCreateMode && loadingTask && !drawerTaskName && !entityTaskName;
 
   return (
     <div className="task-drawer-title-section">
@@ -136,9 +192,10 @@ const TaskDrawerTitleSection = ({ inputRef, t, canCreateTask = true }: Props) =>
       <div className="task-drawer-title-name">
         {isLoadingTaskName ? (
           <Skeleton.Input active size="large" style={{ width: '100%', height: 40 }} />
-        ) : isEditing ? (
+        ) : isCreateMode || isEditing ? (
           <Input
             ref={inputRef}
+            disabled={isCreateMode && createDisabled}
             value={taskName}
             onChange={onTaskNameChange}
             onBlur={handleInputBlur}

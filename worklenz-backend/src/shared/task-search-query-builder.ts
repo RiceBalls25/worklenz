@@ -7,7 +7,7 @@ interface TaskSearchScopeFilter {
 export const buildTaskSearchQuery = (
   searchString: string,
   projectId: string,
-  taskId: string,
+  taskId: string | null | undefined,
   scopeFilter: TaskSearchScopeFilter
 ) => ({
   query: `SELECT t.id AS value,
@@ -19,8 +19,9 @@ export const buildTaskSearchQuery = (
         OR CONCAT(p.key, '-', t.task_no) ILIKE $1
         OR t.task_no::text ILIKE $1
         OR t.id::text ILIKE $1)
-        AND t.project_id = $2 AND t.id != $3
+        AND t.project_id = $2
+        AND ($3::UUID IS NULL OR t.id != $3::UUID)
         ${scopeFilter.clause ? `AND ${scopeFilter.clause}` : ""}
       LIMIT 15;`,
-  params: [`%${(searchString || "").trim()}%`, projectId, taskId, ...scopeFilter.params],
+  params: [`%${(searchString || "").trim()}%`, projectId, taskId ?? null, ...scopeFilter.params],
 });

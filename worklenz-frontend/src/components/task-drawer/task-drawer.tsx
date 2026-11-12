@@ -1,4 +1,18 @@
 import { TabsProps, Tabs, Button, Result, Alert, Flex, Tooltip } from '@/shared/antd-imports';
+import { Modal, message } from 'antd';
+import TaskDetailsForm from './shared/info-tab/task-details-form';
+import { TaskCreateFormState, createEmptyTaskForm } from './task-create-form.types';
+import TaskCreateAssociations from './task-create-associations';
+import { createEmptyTaskRelations, hasUnfinishedRelations } from './task-create-associations.types';
+import type { TaskCreateRelations } from './task-create-associations.types';
+import { persistTaskCreateAssociations } from './task-create-associations.service';
+import { hasBusinessFeatureAccess } from '@/utils/subscription-utils';
+import { useSocket } from '@/socket/socketContext';
+import { SocketEvents } from '@/shared/socket-events';
+import { fetchTasksV3 } from '@/features/task-management/task-management.slice';
+import { setRefreshTimestamp } from '@/features/project/project.slice';
+import { fetchStatuses } from '@/features/taskAttributes/taskStatusSlice';
+import { useTaskDrawerStatuses } from '@/hooks/useTaskDrawerStatuses';
 import Drawer from 'antd/es/drawer';
 import { InputRef } from 'antd/es/input';
 import { useTranslation } from 'react-i18next';
@@ -51,7 +65,30 @@ const TaskDrawer = () => {
   const { canCreateTask } = useTaskCreationPermission();
   const { showTaskDrawer, timeLogEditing, taskAccessDenied, taskAccessFrom, targetDrawerTab } =
     useAppSelector(state => state.taskDrawerReducer);
-  const { taskFormViewModel, selectedTaskId } = useAppSelector(state => state.taskDrawerReducer);
+  const { taskFormViewModel, selectedTaskId, drawerMode } = useAppSelector(
+    state => state.taskDrawerReducer
+  );
+  const isCreateMode = drawerMode === 'create';
+  const { socket, connected } = useSocket();
+  const statuses = useTaskDrawerStatuses();
+  const [createForm, setCreateForm] = useState<TaskCreateFormState>(createEmptyTaskForm);
+  const [createStatus, setCreateStatus] = useState<'idle' | 'submitting' | 'unknown' | 'associating' | 'partial'>('idle');
+  const [createdTaskId, setCreatedTaskId] = useState<string | null>(null);
+  const [createRelations, setCreateRelations] = useState<TaskCreateRelations>(createEmptyTaskRelations);
+  const relationsRef = useRef<TaskCreateRelations>(createEmptyTaskRelations());
+  const associatingRef = useRef(false);
+  const createdTaskIdRef = useRef<string | null>(null);
+  const updateCreateRelations = (next: TaskCreateRelations) => {
+    if (createStatus !== 'idle') return;
+    relationsRef.current = next;
+    setCreateRelations(next);
+  };
+  const requestIdRef = useRef<string | null>(null);
+  const submittedBodyRef = useRef<Record<string, unknown> | null>(null);
+  const cleanupSocketRef = useRef<(() => void) | null>(null);
+  const updateCreateForm = (patch: Partial<TaskCreateFormState>) => {
+    if (createStatus === 'idle') setCreateForm(prev => ({ ...prev, ...patch }));
+  };
   const { projectId, project } = useAppSelector(state => state.projectReducer);
   const priorities = useAppSelector(state => state.priorityReducer.priorities);
   const labels = useAppSelector(state => state.taskLabelsReducer.labels);
@@ -82,6 +119,193 @@ const TaskDrawer = () => {
 
   const dispatch = useAppDispatch();
 
+  useEffect(() => {
+    if (showTaskDrawer && isCreateMode) {
+      cleanupSocketRef.current?.();
+      cleanupSocketRef.current = null;
+      setCreateForm(createEmptyTaskForm());
+      relationsRef.current = createEmptyTaskRelations();
+      setCreateRelations(relationsRef.current);
+      createdTaskIdRef.current = null;
+      setCreatedTaskId(null);
+      associatingRef.current = false;
+      setCreateStatus('idle');
+      requestIdRef.current = null;
+      submittedBodyRef.current = null;
+      setActiveTab('info');
+    }
+  }, [showTaskDrawer, isCreateMode]);
+
+  // Socket callbacks and timers must never survive an unmount.
+  useEffect(() => () => { cleanupSocketRef.current?.(); }, []);
+
+  const persistRelationsAfterCreation = async (taskId: string) => {
+    if (associatingRef.current) return;
+    if (!socket || !projectId || !currentSession?.id || !currentSession.team_id) {
+      setCreateStatus('partial');
+      message.error('主任务已创建，但当前无法保存关联项；请保持抽屉并重试');
+      return;
+    }
+    associatingRef.current = true;
+    setCreateStatus('associating');
+    try {
+      const allSaved = await persistTaskCreateAssociations({
+        socket,
+        projectId,
+        parentTaskId: taskId,
+        reporterId: currentSession.id,
+        teamId: currentSession.team_id,
+        drafts: relationsRef.current,
+        onProgress: progress => {
+          relationsRef.current = progress;
+          setCreateRelations({
+            ...progress,
+            subtasks: [...progress.subtasks],
+            dependencies: [...progress.dependencies],
+            attachments: [...progress.attachments],
+          });
+        },
+      });
+      dispatch(fetchTasksV3(projectId));
+      dispatch(setRefreshTimestamp());
+      if (allSaved) {
+        setCreateStatus('idle');
+        dispatch(setShowTaskDrawer(false));
+        message.success('主任务及全部关联内容创建成功');
+      } else {
+        setCreateStatus('partial');
+        message.warning('主任务已创建，部分关联内容结果未知或失败；请核查提示并重试');
+      }
+    } catch (error) {
+      setCreateStatus('partial');
+      message.error(error instanceof Error ? error.message : '关联保存失败，请重试');
+    } finally {
+      associatingRef.current = false;
+    }
+  };
+
+  const handleConfirmCreate = () => {
+    if (createStatus === 'submitting' || createStatus === 'associating') return;
+    if (createdTaskIdRef.current) {
+      void persistRelationsAfterCreation(createdTaskIdRef.current);
+      return;
+    }
+    if (!projectId || !currentSession?.id || !canCreateTask) {
+      message.error('项目或创建权限不可用');
+      return;
+    }
+    if (!createForm.name.trim()) {
+      message.warning('请填写任务标题');
+      return;
+    }
+    if (createForm.start_date && createForm.end_date && createForm.end_date < createForm.start_date) {
+      message.warning('截止日期不能早于开始日期');
+      return;
+    }
+    if (!socket || !connected) {
+      message.error('Socket 未连接，已保留填写内容');
+      return;
+    }
+
+    // Never lose a typed child name if the user clicks Confirm without clicking Add.
+    // Flush it ONCE before the main task is submitted; after a timeout, the
+    // same stable subtask requestId remains available for a safe retry.
+    const pendingSubtaskName = (relationsRef.current.subtaskInput || '').trim();
+    if (pendingSubtaskName) {
+      const next = {
+        ...relationsRef.current,
+        subtaskInput: '',
+        subtasks: [...relationsRef.current.subtasks, {
+          id: crypto.randomUUID(),
+          requestId: crypto.randomUUID(),
+          name: pendingSubtaskName,
+          state: 'pending' as const,
+        }],
+      };
+      relationsRef.current = next;
+      setCreateRelations(next);
+    }
+
+    // If last attempt timed out, reuse EXACTLY the same payload and request ID.
+    // A new ID here could create a duplicate task after a lost success response.
+    if (!requestIdRef.current) requestIdRef.current = crypto.randomUUID();
+    if (!submittedBodyRef.current) {
+      submittedBodyRef.current = {
+        request_id: requestIdRef.current,
+        project_id: projectId,
+        reporter_id: currentSession.id,
+        team_id: currentSession.team_id,
+        // Do NOT serialize File objects, children or dependency drafts into QUICK_TASK.
+        name: createForm.name.trim(),
+        status_id: createForm.status_id,
+        priority_id: createForm.priority_id,
+        phase_id: createForm.phase_id,
+        assignee_ids: createForm.assignee_ids,
+        label_ids: createForm.label_ids,
+        start_date: createForm.start_date,
+        end_date: createForm.end_date,
+        description: createForm.description,
+      };
+    }
+    const eventName = SocketEvents.QUICK_TASK.toString();
+    const reqId = requestIdRef.current;
+    cleanupSocketRef.current?.();
+    setCreateStatus('submitting');
+    let timer: ReturnType<typeof setTimeout>;
+    let finished = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off(eventName, onResponse);
+      socket.off('disconnect', onDisconnect);
+      if (cleanupSocketRef.current === cleanup) cleanupSocketRef.current = null;
+    };
+    const markUnknown = (reason: string) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      setCreateStatus('unknown');
+      message.warning(reason);
+    };
+    const onDisconnect = () => markUnknown('连接中断：结果未知，请重新连接后使用同一请求重试');
+    const onResponse = (reply: {
+      request_id?: string; success?: boolean;
+      task?: { id?: string }; message?: string;
+    }) => {
+      if (reply?.request_id !== reqId || finished) return;
+      finished = true;
+      cleanup();
+      if (reply.success && reply.task?.id) {
+        createdTaskIdRef.current = reply.task.id;
+        setCreatedTaskId(reply.task.id);
+        requestIdRef.current = null;
+        submittedBodyRef.current = null;
+        if (!hasUnfinishedRelations(relationsRef.current)) {
+          setCreateStatus('idle');
+          dispatch(setShowTaskDrawer(false));
+          dispatch(fetchTasksV3(projectId));
+          dispatch(setRefreshTimestamp());
+          message.success('创建成功');
+        } else {
+          void persistRelationsAfterCreation(reply.task.id);
+        }
+      } else {
+        requestIdRef.current = null;
+        submittedBodyRef.current = null;
+        setCreateStatus('idle');
+        message.error(reply.message || '创建失败，填写内容已保留');
+      }
+    };
+    socket.on(eventName, onResponse);
+    socket.on('disconnect', onDisconnect);
+    timer = setTimeout(() => markUnknown('等待回执超时：结果未知，重试不会重复创建'), 12000);
+    cleanupSocketRef.current = cleanup;
+    try {
+      socket.emit(eventName, JSON.stringify(submittedBodyRef.current));
+    } catch {
+      markUnknown('发送失败：请检查连接后使用原请求重试');
+    }
+  };
+
   // Deep-link: open a specific drawer tab (e.g. Time Log from recent logs)
   // Only apply targetDrawerTab after the correct task has been loaded (selectedTaskId is set)
   useEffect(() => {
@@ -104,6 +328,8 @@ const TaskDrawer = () => {
 
   useEffect(() => {
     if (!showTaskDrawer || taskAccessDenied) return;
+
+    if (projectId && !statuses.length) dispatch(fetchStatuses(projectId));
 
     if (!priorities.length) {
       dispatch(fetchPriorities());
@@ -130,11 +356,9 @@ const TaskDrawer = () => {
       }
 
       if (
+        drawerMode === 'edit' &&
         selectedTaskId &&
-        (
-          taskFormViewModel?.task?.id !== selectedTaskId ||
-          !taskFormViewModel?.task?.name
-        )
+        (taskFormViewModel?.task?.id !== selectedTaskId || !taskFormViewModel?.task?.name)
       ) {
         dispatch(
           fetchTask({
@@ -152,6 +376,8 @@ const TaskDrawer = () => {
     project,
     projectId,
     selectedTaskId,
+    drawerMode,
+    statuses.length,
     showTaskDrawer,
     taskAccessDenied,
     taskAccessFrom,
@@ -178,6 +404,32 @@ const TaskDrawer = () => {
   const handleOnClose = (
     e?: React.MouseEvent<Element, MouseEvent> | React.KeyboardEvent<Element>
   ) => {
+    if (isCreateMode && (createStatus === 'submitting' || createStatus === 'associating')) {
+      message.info('正在提交，请等待结果或超时提示');
+      return;
+    }
+    if (isCreateMode && createdTaskIdRef.current && createStatus === 'partial') {
+      Modal.confirm({
+        title: '主任务已创建，关联内容尚未全部确认',
+        content: `任务 ID：${createdTaskIdRef.current}。关闭会丢失此处的失败关联草稿；可以稍后进入任务详情核查。建议先重试未完成项。`,
+        okText: '关闭并自行核查', cancelText: '继续重试',
+        onOk: () => dispatch(setShowTaskDrawer(false)),
+      });
+      return;
+    }
+    if (isCreateMode && createStatus === 'unknown') {
+      Modal.confirm({
+        title: '任务创建结果尚不明确',
+        content: '可能已经保存到数据库。建议保持此窗口，连接恢复后重试同一请求进行结果核查。仍然关闭吗？',
+        okText: '仍然关闭', cancelText: '保留并重试',
+        onOk: () => {
+          cleanupSocketRef.current?.();
+          dispatch(setShowTaskDrawer(false));
+          setActiveTab('info');
+        },
+      });
+      return;
+    }
     isClosingManually.current = true;
     setActiveTab('info');
     clearTaskFromUrl();
@@ -197,7 +449,7 @@ const TaskDrawer = () => {
   };
 
   const handleAfterOpenChange = (open: boolean) => {
-    if (!open) {
+    if (!open && !showTaskDrawer) {
       dispatch(setSelectedTaskId(null));
       dispatch(setTaskFormViewModel({}));
       dispatch(setTaskSubscribers([]));
@@ -277,6 +529,20 @@ const TaskDrawer = () => {
   ];
 
   const renderFooter = () => {
+    if (isCreateMode) {
+      return (
+        <Flex gap={12} justify="end">
+          <Button onClick={() => handleOnClose()} disabled={createStatus === 'submitting' || createStatus === 'associating'}>
+            {createdTaskId ? '关闭' : '取消'}
+          </Button>
+          <Button type="primary" loading={createStatus === 'submitting' || createStatus === 'associating'}
+            disabled={!canCreateTask || (!createdTaskId && !createForm.name.trim()) || !connected}
+            onClick={handleConfirmCreate}>
+            {createdTaskId ? '重试未完成的关联' : createStatus === 'unknown' ? '重试 / 核查结果' : '确定创建'}
+          </Button>
+        </Flex>
+      );
+    }
     if (taskAccessDenied) return null;
     if (activeTab === 'info' || isSoftwareProject) return <InfoTabFooter />;
     if (activeTab === 'timeLog') {
@@ -289,7 +555,6 @@ const TaskDrawer = () => {
             initialValues={timeLogEditing.logBeingEdited || undefined}
             mode={timeLogEditing.logBeingEdited ? 'edit' : 'create'}
             allowReassign={!!timeLogEditing.logBeingEdited}
-
           />
         );
       }
@@ -324,9 +589,10 @@ const TaskDrawer = () => {
     title: taskAccessDenied ? (
       t('taskAccessDenied.title', { defaultValue: 'No access' })
     ) : (
+      isCreateMode ? '创建任务' :
       <TaskDrawerHeader t={t} canCreateTask={canCreateTask} isGuest={isTaskReadOnly} />
     ),
-    closeIcon: !taskAccessDenied && isSubTask ? <ArrowLeftOutlined /> : <CloseOutlined />,
+    closeIcon: !isCreateMode && !taskAccessDenied && isSubTask ? <ArrowLeftOutlined /> : <CloseOutlined />,
     footer: renderFooter(),
     styles: {
       body: {
@@ -388,13 +654,39 @@ const TaskDrawer = () => {
               inputRef={taskNameInputRef}
               t={t}
               canCreateTask={canCreateTask && !isTaskReadOnly}
+              createName={createForm.name}
+              createDisabled={createStatus !== 'idle'}
+              onCreateNameChange={name => updateCreateForm({ name })}
             />
 
             <div style={{ padding: '0 24px' }}>
-              {isSoftwareProject ? (
+              {isCreateMode ? (
+                <>
+                  <TaskDetailsForm
+                    createForm={createForm}
+                    onCreateFormChange={updateCreateForm}
+                    createDisabled={createStatus !== 'idle'}
+                    canCreateTask={canCreateTask}
+                    isGuest={isTaskReadOnly}
+                  />
+                  <TaskCreateAssociations
+                    projectId={projectId}
+                    drafts={createRelations}
+                    onChange={updateCreateRelations}
+                    disabled={createStatus !== 'idle' || !canCreateTask || isTaskReadOnly}
+                    parentTaskId={createdTaskId}
+                    maxFileSizeMb={hasBusinessFeatureAccess(currentSession) ? 250 : 25}
+                  />
+                </>
+              ) : isSoftwareProject ? (
                 <TaskDrawerInfoTab t={t} canCreateTask={canCreateTask} isGuest={isTaskReadOnly} />
               ) : (
-                <Tabs type="card" items={tabItems} onChange={handleTabChange} activeKey={activeTab} />
+                <Tabs
+                  type="card"
+                  items={tabItems}
+                  onChange={handleTabChange}
+                  activeKey={activeTab}
+                />
               )}
             </div>
           </>

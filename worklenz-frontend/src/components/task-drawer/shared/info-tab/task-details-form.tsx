@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { ConfigProvider, Flex, Form, Typography } from '@/shared/antd-imports';
+import { Input, Select } from 'antd';
+import type { TaskCreateFormState } from '../../task-create-form.types';
 import { useTranslation } from 'react-i18next';
 import { ITaskFormViewModel, ITaskViewModel } from '@/types/tasks/task.types';
 
@@ -41,6 +43,9 @@ interface TaskDetailsFormProps {
   taskFormViewModel?: ITaskFormViewModel | null;
   canCreateTask?: boolean;
   isGuest?: boolean;
+  createForm?: TaskCreateFormState;
+  onCreateFormChange?: (patch: Partial<TaskCreateFormState>) => void;
+  createDisabled?: boolean;
 }
 
 // Custom wrapper that enforces stricter rules for displaying progress input
@@ -82,12 +87,19 @@ const ConditionalProgressInput = ({ task, form }: ConditionalProgressInputProps)
   return null;
 };
 
-const TaskDetailsForm = ({ taskFormViewModel = null, canCreateTask = true, isGuest = false }: TaskDetailsFormProps) => {
+const TaskDetailsForm = ({
+  taskFormViewModel = null, canCreateTask = true, isGuest = false,
+  createForm, onCreateFormChange, createDisabled = false,
+}: TaskDetailsFormProps) => {
   const { t } = useTranslation('task-drawer/task-drawer');
   const [form] = Form.useForm();
   const { project } = useAppSelector(state => state.projectReducer);
   const isSoftwareProject = isSoftwareProjectType(project?.project_type);
   const statuses = useTaskDrawerStatuses();
+  const priorities = useAppSelector(state => state.priorityReducer.priorities);
+  const teamMembers = useAppSelector(state => state.teamMembersReducer.teamMembers);
+  const labels = useAppSelector(state => state.taskLabelsReducer.labels);
+  const phases = useAppSelector(state => state.phaseReducer.phaseList);
   const currentSession = useAuthService().getCurrentSession();
   // Use ref to track the current task ID to prevent unnecessary form resets
   const previousTaskIdRef = useRef<string | null>(null);
@@ -172,6 +184,63 @@ const TaskDetailsForm = ({ taskFormViewModel = null, canCreateTask = true, isGue
       console.error('Form validation failed:', error);
     }
   };
+
+  // CREATE uses the same TaskDetailsForm container/labels, but does NOT mount
+  // edit-only controls that automatically emit updates for an existing taskId.
+  if (createForm && onCreateFormChange) {
+    const teamOptions = (teamMembers?.data || []).map(member => {
+      const item = member as unknown as { id?: string; team_member_id?: string; name?: string; user_name?: string };
+      const id = item.team_member_id || item.id || '';
+      return { value: id, label: item.name || item.user_name || id };
+    }).filter(option => option.value);
+    return (
+      <ConfigProvider theme={{ components: { Form: { itemMarginBottom: 10 } } }}>
+        <Form layout="horizontal" labelCol={{ span: 6 }} wrapperCol={{ span: 18 }}
+          disabled={createDisabled || !canCreateTask || isGuest}>
+          <Form.Item label={t('taskInfoTab.details.status', { defaultValue: 'Status' })}>
+            <Select allowClear placeholder="默认待办" value={createForm.status_id ?? undefined}
+              options={statuses.map(item => ({ value: item.id, label: item.name }))}
+              onChange={value => onCreateFormChange({ status_id: value ?? null })} />
+          </Form.Item>
+          <Form.Item label={t('taskInfoTab.details.priority', { defaultValue: 'Priority' })}>
+            <Select allowClear placeholder="默认优先级" value={createForm.priority_id ?? undefined}
+              options={priorities.map(item => ({ value: item.id, label: item.name }))}
+              onChange={value => onCreateFormChange({ priority_id: value ?? null })} />
+          </Form.Item>
+          <Form.Item label={t('taskInfoTab.details.assignees', { defaultValue: 'Assignees' })}>
+            <Select mode="multiple" showSearch allowClear optionFilterProp="label"
+              value={createForm.assignee_ids} options={teamOptions}
+              onChange={value => onCreateFormChange({ assignee_ids: value })} />
+          </Form.Item>
+          <Form.Item label="阶段">
+            <Select allowClear placeholder="默认阶段" value={createForm.phase_id ?? undefined}
+              options={phases.map(item => ({ value: item.id, label: item.name }))}
+              onChange={value => onCreateFormChange({ phase_id: value ?? null })} />
+          </Form.Item>
+          <Form.Item label="标签">
+            <Select mode="multiple" allowClear showSearch optionFilterProp="label"
+              value={createForm.label_ids}
+              options={labels.map(item => ({ value: item.id, label: item.name }))}
+              onChange={value => onCreateFormChange({ label_ids: value })} />
+          </Form.Item>
+          <Form.Item label="开始日期">
+            <Input type="date" value={createForm.start_date ?? ''}
+              onChange={e => onCreateFormChange({ start_date: e.target.value || null })} />
+          </Form.Item>
+          <Form.Item label="截止日期">
+            <Input type="date" value={createForm.end_date ?? ''}
+              min={createForm.start_date ?? undefined}
+              onChange={e => onCreateFormChange({ end_date: e.target.value || null })} />
+          </Form.Item>
+          <Form.Item label="描述">
+            <Input.TextArea rows={4} value={createForm.description}
+              onChange={e => onCreateFormChange({ description: e.target.value })} />
+          </Form.Item>
+          {/* Attachment/subtask/dependency drafts are rendered below in the same TaskDrawer. */}
+        </Form>
+      </ConfigProvider>
+    );
+  }
 
   const task = taskFormViewModel?.task as ITaskViewModel | undefined;
 

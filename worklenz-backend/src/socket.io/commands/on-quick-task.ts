@@ -57,8 +57,62 @@ function createGaantTask(body: any) {
 }
 
 export async function on_quick_task(_io: Server, socket: Socket, data?: string) {
+  let requestId: string | undefined;
+  const emitResult = (payload: unknown, success = true, message?: string) => {
+    socket.emit(
+      SocketEvents.QUICK_TASK.toString(),
+      requestId ? { request_id: requestId, success, task: success ? payload : null, message } : payload
+    );
+  };
   try {
     const body = JSON.parse(data as string);
+    requestId = typeof body.request_id === "string" ? body.request_id : undefined;
+    if (requestId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) {
+      emitResult(null, false, "Invalid request ID");
+      return;
+    }
+    const authenticatedUserId = getLoggedInUserIdFromSocket(socket);
+    if (!authenticatedUserId) {
+      emitResult(null, false, "Not authenticated");
+      return;
+    }
+    // Never trust the reporter ID supplied in the browser payload.
+    body.reporter_id = authenticatedUserId;
+    if (!body.project_id) {
+      emitResult(null, false, "Project ID is required");
+      return;
+    }
+    const projectLookup = await db.query(
+      "SELECT team_id FROM projects WHERE id = $1::uuid", [body.project_id]
+    );
+    if (!projectLookup.rows[0]) {
+      emitResult(null, false, "Project not found");
+      return;
+    }
+    body.team_id = projectLookup.rows[0].team_id;
+    // The UI permission hook is only a convenience. Re-check on the server.
+    const permission = await db.query(
+      `SELECT (
+        EXISTS (
+          SELECT 1 FROM projects p
+          JOIN team_members tm ON tm.team_id = p.team_id
+          JOIN roles r ON r.id = tm.role_id
+          WHERE p.id = $1::uuid AND tm.user_id = $2::uuid
+            AND (r.owner IS TRUE OR r.admin_role IS TRUE)
+        ) OR EXISTS (
+          SELECT 1 FROM project_members pm
+          JOIN team_members tm ON tm.id = pm.team_member_id
+          JOIN project_access_levels pal ON pal.id = pm.project_access_level_id
+          WHERE pm.project_id = $1::uuid AND tm.user_id = $2::uuid
+            AND pal.key <> 'GUEST'
+        )
+      ) AS allowed`,
+      [body.project_id, authenticatedUserId]
+    );
+    if (!permission.rows[0]?.allowed) {
+      emitResult(null, false, "Not allowed to create tasks in this project");
+      return;
+    }
 
     body.name = (body.name || "").trim();
     body.priority_id = body.priority_id?.trim() || null;
@@ -78,17 +132,17 @@ export async function on_quick_task(_io: Server, socket: Socket, data?: string) 
       if (userId && body.project_id) {
         const restricted = await isTaskCreationRestricted(userId, body.project_id);
         if (restricted) {
-          socket.emit(SocketEvents.QUICK_TASK.toString(), {
-            error: true,
-            message: "Task creation is restricted. Please contact admin for access."
-          });
+          emitResult(null, false, "Task creation is restricted. Please contact admin for access.");
           return;
         }
       }
 
       body.total_minutes = toMinutes(body.total_hours, body.total_minutes);
-      const result = await createQuickTaskRecord(JSON.stringify(body), body.project_id, body.issue_type);
-      const [d] = result.rows;
+      const { rows, replayed } = await createQuickTaskRecord(
+        JSON.stringify(body), body.project_id, body.issue_type,
+        requestId ? { requestId, userId: authenticatedUserId } : undefined
+      );
+      const [d] = rows;
       if (d.task) {
 
         if (body.chart_start) {
@@ -101,7 +155,10 @@ export async function on_quick_task(_io: Server, socket: Socket, data?: string) 
 
         updatePhaseInfo(model, body);
 
-        socket.emit(SocketEvents.QUICK_TASK.toString(), model);
+        emitResult(model);
+
+        // Replayed requests return the original task but MUST NOT repeat side effects.
+        if (replayed) return;
 
         if (body.is_dragged) {
           logStartDateChange({
@@ -150,10 +207,16 @@ export async function on_quick_task(_io: Server, socket: Socket, data?: string) 
       }
     } else {
       // Empty task name, emit null to indicate no task was created
-      socket.emit(SocketEvents.QUICK_TASK.toString(), null);
+      emitResult(null, false, "Task name is required");
     }
   } catch (error) {
     log_error(error);
-    socket.emit(SocketEvents.QUICK_TASK.toString(), null);
+    const knownErrors = new Set([
+      "REQUEST_ID_REUSED_WITH_DIFFERENT_PAYLOAD",
+      "INVALID_ASSOCIATION_ID",
+      "INVALID_TASK_LABEL",
+    ]);
+    emitResult(null, false,
+      error instanceof Error && knownErrors.has(error.message) ? error.message : "Task creation failed");
   }
 }
